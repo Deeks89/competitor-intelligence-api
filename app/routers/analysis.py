@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
 from app.database import get_db
 from app.models.competitor import Competitor
 from app.models.analysis import Analysis
@@ -9,17 +11,19 @@ from app.services.firecrawl_service import scrape_competitor_website, scrape_g2_
 
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
 
-@router.post("/{competitor_id}", response_model=AnalysisRead)
-async def analyze_competitor(competitor_id: int, db: Session = Depends(get_db)):
+@router.post("/{competitor_id}/run", response_model=AnalysisRead)
+async def analyze_competitor(competitor_id: int, db: AsyncSession = Depends(get_db)):
     # Step 1 — find the competitor in DB
-    competitor = db.query(Competitor).filter(Competitor.id == competitor_id).first()
+    result = await db.execute(select(Competitor).where(Competitor.id == competitor_id))
+    competitor = result.scalar_one_or_none()
     if not competitor:
         raise HTTPException(status_code=404, detail="Competitor not found")
 
     # Step 2 — check if analysis already exists (dedup)
-    existing = db.query(Analysis).filter(Analysis.competitor_id == competitor_id).first()
-    if existing:
-        return existing
+    existing = await db.execute(select(Analysis).where(Analysis.competitor_id == competitor_id))
+    existing_analysis = existing.scalar_one_or_none()
+    if existing_analysis:
+        return existing_analysis
 
     # Step 3 — scrape competitor website via Firecrawl
     website_content = ""
@@ -46,14 +50,13 @@ async def analyze_competitor(competitor_id: int, db: Session = Depends(get_db)):
         raw_scraped_content=combined_content[:10000],
     )
     db.add(analysis)
-    db.commit()
-    db.refresh(analysis)
-
+    await db.flush()
     return analysis
 
 @router.get("/{competitor_id}", response_model=AnalysisRead)
-def get_analysis(competitor_id: int, db: Session = Depends(get_db)):
-    analysis = db.query(Analysis).filter(Analysis.competitor_id == competitor_id).first()
+async def get_analysis(competitor_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Analysis).where(Analysis.competitor_id == competitor_id))
+    analysis = result.scalar_one_or_none()
     if not analysis:
         raise HTTPException(status_code=404, detail="Analysis not found")
     return analysis
