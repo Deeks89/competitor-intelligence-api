@@ -1,45 +1,59 @@
-# models/analysis.py — Defines the "analyses" table in PostgreSQL
-# Stores the intelligence Claude extracts for each competitor
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from app.database import get_db
+from app.models.competitor import Competitor
+from app.models.analysis import Analysis
+from app.schemas.analysis import AnalysisRead
+from app.services.claude_service import extract_signals
+from app.services.firecrawl_service import scrape_competitor_website, scrape_g2_page
 
-from datetime import datetime
-from sqlalchemy import String, DateTime, Float, ForeignKey, JSON, func
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+router = APIRouter(prefix="/api/analysis", tags=["analysis"])
 
-from app.database import Base
+@router.post("/{competitor_id}", response_model=AnalysisRead)
+async def analyze_competitor(competitor_id: int, db: Session = Depends(get_db)):
+    # Step 1 — find the competitor in DB
+    competitor = db.query(Competitor).filter(Competitor.id == competitor_id).first()
+    if not competitor:
+        raise HTTPException(status_code=404, detail="Competitor not found")
 
+    # Step 2 — check if analysis already exists (dedup)
+    existing = db.query(Analysis).filter(Analysis.competitor_id == competitor_id).first()
+    if existing:
+        return existing
 
-class Analysis(Base):
-    __tablename__ = "analyses"
+    # Step 3 — scrape competitor website via Firecrawl
+    website_content = ""
+    if competitor.website:
+        website_content = await scrape_competitor_website(competitor.website)
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    # Step 4 — scrape G2 page for reviews and ratings
+    g2_content = await scrape_g2_page(competitor.name)
 
-    # Foreign key — links this analysis to a specific competitor
-    # "competitors.id" means: the "id" column in the "competitors" table
-    competitor_id: Mapped[int] = mapped_column(ForeignKey("competitors.id"), nullable=False)
+    # Step 5 — combine both sources and send to Claude
+    combined_content = f"WEBSITE CONTENT:\n{website_content}\n\nG2 REVIEWS:\n{g2_content}"
+    signals = await extract_signals(combined_content, competitor.name)
 
-    # Pricing intelligence
-    pricing_model: Mapped[str] = mapped_column(String(100), nullable=True)  # e.g. "freemium", "per-seat"
-    pricing_min: Mapped[float] = mapped_column(Float, nullable=True)         # Lowest tier price
-    pricing_max: Mapped[float] = mapped_column(Float, nullable=True)         # Highest tier price
+    # Step 6 — save to analyses table
+    analysis = Analysis(
+        competitor_id=competitor_id,
+        pricing_model=signals.get("pricing_model"),
+        pricing_min=signals.get("pricing_min"),
+        pricing_max=signals.get("pricing_max"),
+        features=signals.get("features"),
+        strengths=signals.get("strengths"),
+        weaknesses=signals.get("weaknesses"),
+        target_market=signals.get("target_market"),
+        raw_scraped_content=combined_content[:10000],
+    )
+    db.add(analysis)
+    db.commit()
+    db.refresh(analysis)
 
-    # Signals extracted by Claude (stored as flexible JSON)
-    # JSON lets you store any structure: lists, dicts, nested data
-    features: Mapped[dict] = mapped_column(JSON, nullable=True)       # Key product features
-    strengths: Mapped[dict] = mapped_column(JSON, nullable=True)      # What they do well
-    weaknesses: Mapped[dict] = mapped_column(JSON, nullable=True)     # Where they fall short
-    target_market: Mapped[str] = mapped_column(String(500), nullable=True)  # Who they sell to
+    return analysis
 
-    # Raw scraped content — saved for debugging or re-processing
-    raw_scraped_content: Mapped[str] = mapped_column(String(50000), nullable=True)
-
-    # G2 review data
-    g2_rating: Mapped[float] = mapped_column(Float, nullable=True)    # e.g. 4.5
-    g2_review_count: Mapped[int] = mapped_column(nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-
-    # Relationship back to the competitor
-    competitor: Mapped["Competitor"] = relationship("Competitor", back_populates="analyses")
-
-    def __repr__(self):
-        return f"<Analysis: competitor_id={self.competitor_id}>"
+@router.get("/{competitor_id}", response_model=AnalysisRead)
+def get_analysis(competitor_id: int, db: Session = Depends(get_db)):
+    analysis = db.query(Analysis).filter(Analysis.competitor_id == competitor_id).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    return analysis
